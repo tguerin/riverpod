@@ -168,9 +168,8 @@ sealed class ProviderSubscriptionImpl<OutT> extends ProviderSubscription<OutT>
       return;
     }
 
-    _listenedElement.onSubscriptionResumeOrReactivate(this, applyResume);
-
     _listenedElement.flush();
+    _listenedElement.onSubscriptionResumeOrReactivate(this, applyResume);
   }
 
   @mustCallSuper
