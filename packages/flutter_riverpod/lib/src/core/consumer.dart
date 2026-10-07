@@ -384,6 +384,29 @@ base class ConsumerStatefulElement extends StatefulElement
   ValueListenable<bool>? _tickerModeNotifier;
   bool? _isActive;
 
+  /// Set while [_updateTickerMode] pauses or resumes the subscriptions of
+  /// this element.
+  ///
+  /// Resuming a subscription replays the notification it missed while paused,
+  /// which targets this element. [_updateTickerMode] runs from the lifecycle
+  /// of an ancestor (the `TickerMode` being rebuilt, or this element being
+  /// activated), so this element is below the widget currently being built
+  /// and can be marked dirty synchronously.
+  var _isUpdatingTickerMode = false;
+
+  /// Whether a rebuild of this element was already deferred to the end of the
+  /// current frame.
+  var _hasDeferredRebuild = false;
+
+  /// The [ConsumerStatefulElement] currently running its [build], if any.
+  ///
+  /// Debug-only: names the widget being built when a provider change has to
+  /// be deferred to the next frame.
+  static ConsumerStatefulElement? _debugBuildingElement;
+
+  /// The nearest [UncontrolledProviderScope] above this element, if any.
+  _UncontrolledProviderScopeState? _scope;
+
   @override
   void mount(Element? parent, Object? newSlot) {
     super.mount(parent, newSlot);
@@ -394,12 +417,18 @@ base class ConsumerStatefulElement extends StatefulElement
     } catch (e) {
       // Silence 'no scope' error. It is already reported by the container variable.
     }
+    _updateScope();
   }
 
   @override
   void activate() {
     super.activate();
+    _updateScope();
     _updateTickerModeNotifier();
+  }
+
+  void _updateScope() {
+    _scope = _UncontrolledProviderScopeState._nearestScopeOf(this);
   }
 
   void _applyTickerMode(ProviderSubscription sub) {
@@ -421,12 +450,17 @@ base class ConsumerStatefulElement extends StatefulElement
     final isActive = _tickerModeNotifier!.value;
     if (isActive != _isActive) {
       _isActive = isActive;
-      for (final sub in _dependencies.values) {
-        if (isActive) {
-          sub.resume();
-        } else {
-          sub.pause();
+      _isUpdatingTickerMode = true;
+      try {
+        for (final sub in _dependencies.values) {
+          if (isActive) {
+            sub.resume();
+          } else {
+            sub.pause();
+          }
         }
+      } finally {
+        _isUpdatingTickerMode = false;
       }
     }
   }
@@ -434,6 +468,7 @@ base class ConsumerStatefulElement extends StatefulElement
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
+    _updateScope();
     final newContainer = ProviderScope.containerOf(this);
     if (container != newContainer) {
       container = newContainer;
@@ -450,6 +485,11 @@ base class ConsumerStatefulElement extends StatefulElement
       _updateTickerModeNotifier();
     }
 
+    ConsumerStatefulElement? debugPreviouslyBuildingElement;
+    if (kDebugMode) {
+      debugPreviouslyBuildingElement = _debugBuildingElement;
+      _debugBuildingElement = this;
+    }
     try {
       _oldDependencies = _dependencies;
       for (var i = 0; i < _listeners.length; i++) {
@@ -463,7 +503,77 @@ base class ConsumerStatefulElement extends StatefulElement
         dep.close();
       }
       _oldDependencies = null;
+      if (kDebugMode) _debugBuildingElement = debugPreviouslyBuildingElement;
     }
+  }
+
+  /// Marks this element as needing to build because [target] changed.
+  ///
+  /// When the change happens while Flutter is building a frame and this
+  /// element is not below the scope notifying from its own build, if any (a
+  /// stale provider flushed by `ref.watch` during another widget's build, a
+  /// listener modifying a provider during a build, a nested scope's refresh
+  /// writing a root provider, a subscription resumed by `TickerMode`
+  /// notifying other widgets...), calling [markNeedsBuild] synchronously
+  /// throws in debug mode and, in release mode, leaves this element flagged
+  /// dirty without ever rebuilding it again. The rebuild is then deferred to
+  /// the end of the frame.
+  void _rebuildOnProviderChange(ProviderListenable<Object?> target) {
+    // Already scheduled for a rebuild, or currently building: nothing to do.
+    if (dirty) return;
+
+    if (_isUpdatingTickerMode ||
+        _UncontrolledProviderScopeState._canMarkDirtySynchronously(_scope)) {
+      markNeedsBuild();
+      return;
+    }
+
+    if (_hasDeferredRebuild) return;
+    _hasDeferredRebuild = true;
+    // Deferrals caused by a scope's own refresh are routine cross-scope
+    // propagation, not something to report.
+    if (kDebugMode && _UncontrolledProviderScopeState._notifyingDepth == 0) {
+      _debugReportNotifiedDuringBuild(target);
+    }
+    _rebuildAfterFrame(() {
+      _hasDeferredRebuild = false;
+      if (mounted) markNeedsBuild();
+    });
+  }
+
+  void _debugReportNotifiedDuringBuild(ProviderListenable<Object?> target) {
+    final building = _debugBuildingElement;
+
+    FlutterError.reportError(
+      FlutterErrorDetails(
+        exception: FlutterError.fromParts([
+          ErrorSummary(
+            'A provider notified a widget while the widget tree was building.',
+          ),
+          ErrorDescription(
+            '$target notified ${widget.runtimeType} while Flutter was '
+            'building widgets, outside of a ProviderScope refresh. '
+            'This typically happens when a stale provider is read during a '
+            'widget build, or when a provider is modified from a widget '
+            'lifecycle or from a listener running during a build.',
+          ),
+          describeElement('The widget that was notified was'),
+          if (building != null && building != this)
+            building.describeElement('The widget currently being built was'),
+          ErrorHint(
+            'Riverpod deferred the rebuild of ${widget.runtimeType} to the '
+            'next frame instead of marking it dirty synchronously, which '
+            'Flutter would reject. The stack trace points to the code that '
+            'triggered the notification.',
+          ),
+        ]),
+        stack: StackTrace.current,
+        library: 'riverpod',
+        context: ErrorDescription(
+          'while notifying a widget of a provider change',
+        ),
+      ),
+    );
   }
 
   void _assertNotDisposed() {
@@ -489,7 +599,7 @@ base class ConsumerStatefulElement extends StatefulElement
 
               final sub = container.listen<StateT>(
                 target,
-                (_, _) => markNeedsBuild(),
+                (_, _) => _rebuildOnProviderChange(target),
               );
               _applyTickerMode(sub);
               return sub;

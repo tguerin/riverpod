@@ -7,6 +7,31 @@ import 'provider_container_test.dart';
 
 void main() {
   group('AutoDispose', () {
+    test('a refresh requested from onDispose while the scheduler disposes '
+        'providers is applied in the same task', () async {
+      final container = ProviderContainer.test();
+      var buildCount = 0;
+      final watched = Provider<int>((ref) => ++buildCount);
+      final disposable = Provider.autoDispose<int>((ref) {
+        ref.onDispose(() => container.invalidate(watched));
+        return 0;
+      });
+      final values = <int>[];
+      container.listen(
+        watched,
+        (_, next) => values.add(next),
+        fireImmediately: true,
+      );
+      expect(values, [1]);
+
+      final sub = container.listen(disposable, (_, _) {});
+      await container.pump();
+      sub.close();
+      await container.pump();
+
+      expect(values, [1, 2]);
+    });
+
     test(
       'Supports clearing the state of elements with only weak listeners',
       () async {

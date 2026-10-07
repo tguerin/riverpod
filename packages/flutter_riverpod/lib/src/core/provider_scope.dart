@@ -149,6 +149,10 @@ final class ProviderScopeState extends State<ProviderScope> {
   ProviderContainer? _debugParentOwner;
   var _dirty = false;
 
+  /// The state of the [UncontrolledProviderScope] built by this widget, once
+  /// mounted. Set by that state itself.
+  _UncontrolledProviderScopeState? _scope;
+
   @override
   void initState() {
     super.initState();
@@ -209,7 +213,11 @@ final class ProviderScopeState extends State<ProviderScope> {
 
     if (_dirty) {
       _dirty = false;
-      container.updateOverrides(widget.overrides);
+      // The new overrides notify widgets below this scope, which can be
+      // marked dirty synchronously while this scope is being built.
+      _UncontrolledProviderScopeState._notifyFromBuild(_scope, () {
+        container.updateOverrides(widget.overrides);
+      });
     }
 
     return UncontrolledProviderScope(container: container, child: widget.child);
@@ -256,6 +264,62 @@ class UncontrolledProviderScope extends StatefulWidget {
 final class _UncontrolledProviderScopeState
     extends State<UncontrolledProviderScope>
     implements Vsync {
+  /// How many scopes are currently notifying widgets from their own build:
+  /// running their scheduler task, or applying new overrides.
+  static var _notifyingDepth = 0;
+
+  /// The innermost scope currently notifying widgets from its own build.
+  ///
+  /// Flutter accepts marking descendants of the widget being built as dirty.
+  /// So while a scope notifies from its build, `setState`/`markNeedsBuild`
+  /// can be called synchronously on anything below that scope even though a
+  /// frame is being built. Anything else has to wait for the end of the
+  /// frame: a widget or scope above a nested scope whose refresh wrote a root
+  /// provider, another scope exposing the same container, ...
+  static _UncontrolledProviderScopeState? _notifyingScope;
+
+  /// Runs [notify], which notifies widgets from within the build of [scope].
+  static void _notifyFromBuild(
+    _UncontrolledProviderScopeState? scope,
+    void Function() notify,
+  ) {
+    final previousScope = _notifyingScope;
+    _notifyingDepth++;
+    _notifyingScope = scope;
+    try {
+      notify();
+    } finally {
+      _notifyingDepth--;
+      _notifyingScope = previousScope;
+    }
+  }
+
+  /// Whether `setState`/`markNeedsBuild` can be called right now on an element
+  /// whose nearest scope is [nearest] (`null` if it has none).
+  static bool _canMarkDirtySynchronously(
+    _UncontrolledProviderScopeState? nearest,
+  ) {
+    if (!_isFlutterBuildingFrame()) return true;
+
+    final notifying = _notifyingScope;
+    return notifying != null && nearest != null && nearest._isBelow(notifying);
+  }
+
+  /// The nearest [UncontrolledProviderScope] above [context], if any.
+  static _UncontrolledProviderScopeState? _nearestScopeOf(
+    BuildContext context,
+  ) {
+    final element = context
+        .getElementForInheritedWidgetOfExactType<_UncontrolledProviderScope>();
+    return (element?.widget as _UncontrolledProviderScope?)?.scope;
+  }
+
+  /// The nearest [UncontrolledProviderScope] above this one, if any.
+  _UncontrolledProviderScopeState? _parentScope;
+
+  /// The [ProviderScope] that built this widget, if any.
+  ProviderScopeState? _owner;
+
   Task? _task;
   Timer? _vsyncTimer;
   Timer? _vsyncTimOutTimer;
@@ -264,6 +328,7 @@ final class _UncontrolledProviderScopeState
   @override
   void initState() {
     super.initState();
+    _updateAncestors();
 
     if (kDebugMode) debugCanModifyProviders ??= _debugCanModifyProviders;
     assert(
@@ -271,6 +336,49 @@ final class _UncontrolledProviderScopeState
       'Sync already added',
     );
     widget.container.scheduler.flutterVsyncs.add(this);
+  }
+
+  @override
+  void activate() {
+    super.activate();
+    _updateAncestors();
+  }
+
+  void _updateAncestors() {
+    _parentScope = _nearestScopeOf(context);
+
+    // When built by a ProviderScope, that scope is the direct parent.
+    Element? parent;
+    context.visitAncestorElements((element) {
+      parent = element;
+      return false;
+    });
+    final parentState = switch (parent) {
+      final StatefulElement element => element.state,
+      _ => null,
+    };
+    final owner = parentState is ProviderScopeState ? parentState : null;
+    if (owner != _owner) {
+      _detachFromOwner();
+      _owner = owner;
+      owner?._scope = this;
+    }
+  }
+
+  void _detachFromOwner() {
+    final owner = _owner;
+    if (owner != null && identical(owner._scope, this)) owner._scope = null;
+    _owner = null;
+  }
+
+  /// Whether this scope is [scope] or nested below it.
+  bool _isBelow(_UncontrolledProviderScopeState scope) {
+    _UncontrolledProviderScopeState? current = this;
+    while (current != null) {
+      if (identical(current, scope)) return true;
+      current = current._parentScope;
+    }
+    return false;
   }
 
   @override
@@ -293,7 +401,9 @@ final class _UncontrolledProviderScopeState
 
     final task = _task;
     _task = null;
-    task?.call();
+    if (task == null) return;
+
+    _notifyFromBuild(this, task.call);
   }
 
   void _debugAssertCanScheduleTask(Task task) {
@@ -315,9 +425,28 @@ final class _UncontrolledProviderScopeState
     _cancelAsyncTask?.call();
     _cancelAsyncTask = null;
 
-    setState(() {
+    if (_canMarkDirtySynchronously(this)) {
+      setState(() {
+        _task = task;
+      });
+    } else {
+      // The refresh was requested while Flutter is building the widget tree,
+      // and this scope is not below the scope notifying from its build, if
+      // any: `ref.invalidate` from a widget's build or initState, a listener
+      // invalidating a provider, a stale provider flushed by `ref.watch`
+      // during a build, a nested scope's refresh writing a root provider...
+      // Calling setState now would throw in debug mode and, in release mode,
+      // leave this scope flagged dirty without ever rebuilding it again (see
+      // [_isFlutterBuildingFrame]). Rebuild once the frame is done instead,
+      // which runs the task on the next frame.
       _task = task;
-    });
+      if (kDebugMode && _notifyingDepth == 0) {
+        _debugReportRefreshScheduledDuringBuild();
+      }
+      _rebuildAfterFrame(() {
+        if (mounted && _task != null) setState(() {});
+      });
+    }
 
     _vsyncTimer?.cancel();
     _vsyncTimer = Timer(Duration.zero, () {
@@ -362,20 +491,66 @@ final class _UncontrolledProviderScopeState
     };
   }
 
+  void _debugReportRefreshScheduledDuringBuild() {
+    final toRefresh = widget.container.scheduler.stateToRefresh;
+    final provider = toRefresh.isEmpty ? null : toRefresh.last.origin;
+    final building = ConsumerStatefulElement._debugBuildingElement;
+
+    FlutterError.reportError(
+      FlutterErrorDetails(
+        exception: FlutterError.fromParts([
+          ErrorSummary(
+            'A provider refresh was requested while the widget tree was building.',
+          ),
+          ErrorDescription(
+            '${provider ?? 'A provider'} was invalidated while Flutter was '
+            'building widgets, outside of a ProviderScope refresh. '
+            'This typically happens when a widget invalidates or modifies a '
+            'provider from build/initState/didChangeDependencies, or when a '
+            'stale provider read during a widget build invalidates its '
+            'dependents.',
+          ),
+          if (building != null)
+            building.describeElement('The widget currently being built was'),
+          ErrorHint(
+            'Riverpod deferred the refresh to the next frame instead of '
+            'rebuilding the ProviderScope synchronously, which Flutter would '
+            'reject. The stack trace points to the code that requested it.',
+          ),
+        ]),
+        stack: StackTrace.current,
+        library: 'riverpod',
+        context: ErrorDescription('while scheduling a provider refresh'),
+      ),
+    );
+  }
+
   void _debugCanModifyProviders() {
     if (!kDebugMode) {
       throw StateError(
         'debugCanModifyProviders should not be called outside of debug mode',
       );
     }
+    // While a scope notifies from its build, listeners and observers may
+    // legitimately modify providers: whatever they notify outside of that
+    // scope is deferred to the next frame.
+    if (_notifyingDepth > 0) return;
+
     try {
       setState(() {});
     } catch (err) {
-      throw FlutterError.fromParts([
-        ErrorSummary(
-          'Tried to modify a provider while the widget tree was building.',
-        ),
-        ErrorDescription('''
+      // Report rather than throw. The modification is applied either way in
+      // release mode, and the widgets it notifies are rebuilt on the next
+      // frame. Throwing here would stop the notification instead, leaving the
+      // provider updated but its watchers stale, which release mode never
+      // does.
+      FlutterError.reportError(
+        FlutterErrorDetails(
+          exception: FlutterError.fromParts([
+            ErrorSummary(
+              'Tried to modify a provider while the widget tree was building.',
+            ),
+            ErrorDescription('''
 If you are encountering this error, chances are you tried to modify a provider
 in a widget life-cycle, such as but not limited to:
 - build
@@ -384,9 +559,9 @@ in a widget life-cycle, such as but not limited to:
 - didUpdateWidget
 - didChangeDependencies
 
-Modifying a provider inside those life-cycles is not allowed, as it could
-lead to an inconsistent UI state. For example, two widgets could listen to the
-same provider, but incorrectly receive different states.
+Modifying a provider inside those life-cycles is discouraged, as it leads to
+an inconsistent UI state for one frame: the widgets watching the provider are
+rebuilt on the next frame only.
 
 
 To fix this problem, you have one of two solutions:
@@ -398,7 +573,12 @@ To fix this problem, you have one of two solutions:
   in a `Future(() {...})`.
   This will perform your update after the widget tree is done building.
 '''),
-      ]);
+          ]),
+          stack: StackTrace.current,
+          library: 'riverpod',
+          context: ErrorDescription('while modifying a provider'),
+        ),
+      );
     }
   }
 
@@ -408,6 +588,7 @@ To fix this problem, you have one of two solutions:
 
     return _UncontrolledProviderScope(
       container: widget.container,
+      scope: this,
       child: widget.child,
     );
   }
@@ -424,20 +605,56 @@ To fix this problem, you have one of two solutions:
       debugCanModifyProviders = null;
     }
 
+    _detachFromOwner();
     widget.container.scheduler.flutterVsyncs.remove(this);
+
+    // The scheduler handed its pending task to this scope. Without this, the
+    // task would never run and the scheduler would ignore every later request,
+    // when the container outlives its scope (a scope rebuilt with a new key,
+    // ...). Run it as soon as possible instead. Another scope exposing the
+    // same container may run it first, and the container may be disposed in
+    // the meantime: the task handles both.
+    final task = _task;
+    _task = null;
+    if (task != null && !task.completed) {
+      scheduleMicrotask(task.call);
+    }
 
     super.dispose();
   }
+}
+
+/// Whether Flutter is building, laying out or painting a frame.
+///
+/// During that phase, `setState`/`markNeedsBuild` on an element that is not
+/// below the widget currently being built throws in debug mode. In release
+/// mode, the element is flagged dirty but the current build pass does not
+/// visit it again: it is dropped from the dirty list at the end of the pass
+/// while still flagged dirty, so every later `markNeedsBuild` returns early
+/// and the element never rebuilds again.
+bool _isFlutterBuildingFrame() {
+  return SchedulerBinding.instance.schedulerPhase ==
+      SchedulerPhase.persistentCallbacks;
+}
+
+/// Runs [rebuild] once the current frame is done, and schedules a new frame.
+void _rebuildAfterFrame(void Function() rebuild) {
+  SchedulerBinding.instance.addPostFrameCallback((_) => rebuild());
+  SchedulerBinding.instance.scheduleFrame();
 }
 
 final class _UncontrolledProviderScope extends InheritedWidget {
   const _UncontrolledProviderScope({
     super.key,
     required this.container,
+    required this.scope,
     required super.child,
   });
 
   final ProviderContainer container;
+
+  /// The state exposing [container]. Constant for a given element.
+  final _UncontrolledProviderScopeState scope;
   @override
   bool updateShouldNotify(_UncontrolledProviderScope oldWidget) {
     return container != oldWidget.container;

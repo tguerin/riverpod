@@ -165,8 +165,17 @@ class ProviderScheduler {
     if (pendingTask == null || pendingTaskCompleter == null) return;
     pendingTaskCompleter.complete();
 
-    _performRefresh();
-    _performDispose();
+    // Refreshing or disposing providers can request more refreshes/disposes
+    // (`ref.invalidate` from an `onDispose` callback, ...). No new task is
+    // scheduled while this one runs: those requests are appended to the lists
+    // instead, so keep draining both lists until nothing was added.
+    var refreshed = 0;
+    var disposed = 0;
+    while (refreshed < stateToRefresh.length ||
+        disposed < _stateToDispose.length) {
+      refreshed = _performRefresh(from: refreshed);
+      disposed = _performDispose(from: disposed);
+    }
     stateToRefresh.clear();
     _stateToDispose.clear();
     _pendingTask = null;
@@ -186,17 +195,21 @@ class ProviderScheduler {
   }
 
   Set<ProviderElement>? _builtWithinFrame;
-  void _performRefresh() {
+
+  /// Refreshes the providers of [stateToRefresh] starting at [from], and
+  /// returns the index after the last one refreshed.
+  int _performRefresh({required int from}) {
     if (kDebugMode) _builtWithinFrame = {};
 
     /// No need to traverse entries from top to bottom, because refreshing a
     /// child will automatically refresh its parent when it will try to read it
-    for (var i = 0; i < stateToRefresh.length; i++) {
+    for (var i = from; i < stateToRefresh.length; i++) {
       final element = stateToRefresh[i];
       if (element.isActive) element.flush();
     }
 
     if (kDebugMode) _builtWithinFrame = null;
+    return stateToRefresh.length;
   }
 
   void debugScheduleFrame(void Function() onEvent) {
@@ -225,13 +238,15 @@ class ProviderScheduler {
     _scheduleTask(taskNeedsRefresh: false);
   }
 
-  void _performDispose() {
+  /// Disposes the providers of [_stateToDispose] starting at [from], and
+  /// returns the index after the last one visited.
+  int _performDispose({required int from}) {
     /// No need to traverse entries from children to parents as a parent cannot
     /// have no listener until its children are disposed first.
     /// Worse case scenario, a parent will be added twice to the list (parent child parent)
     /// but when the parent is traversed first, it will still have listeners,
     /// and the second time it is traversed, it won't anymore.
-    for (var i = 0; i < _stateToDispose.length; i++) {
+    for (var i = from; i < _stateToDispose.length; i++) {
       final element = _stateToDispose[i];
       final links = element.ref?._keepAliveLinks;
 
@@ -248,6 +263,8 @@ class ProviderScheduler {
         element.clearState();
       }
     }
+
+    return _stateToDispose.length;
   }
 
   /// Disposes the scheduler.
