@@ -387,9 +387,10 @@ extension on Node {
 class ProviderDependencyChangeEvent extends Event {
   ProviderDependencyChangeEvent(ProviderElement element)
     : elementId = element._debugId,
-      dependents = ((element.dependents ?? const [])
-          .map((sub) => sub.source.meta)
-          .toSet()),
+      dependents =
+          ((element.dependents ?? const <ProviderSubscriptionImpl<Object?>>{})
+              .map((sub) => sub.source.meta)
+              .toSet()),
       weakDependents = (element.weakDependents
           .map((sub) => sub.source.meta)
           .toSet()),

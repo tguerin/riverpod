@@ -215,6 +215,156 @@ void main() {
       );
     });
 
+    testWidgets('TickerMode pauses and resumes all of its consumers, '
+        'including after some of them unmount', (tester) async {
+      final provider = Provider((ref) => 0);
+
+      Widget build({required bool enabled, required int consumers}) {
+        return ProviderScope(
+          child: TickerMode(
+            enabled: enabled,
+            child: Column(
+              children: [
+                for (var i = 0; i < consumers; i++)
+                  Consumer(
+                    key: ValueKey(i),
+                    builder: (context, ref, _) {
+                      ref.watch(provider);
+                      return const SizedBox();
+                    },
+                  ),
+              ],
+            ),
+          ),
+        );
+      }
+
+      Matcher allPaused({required bool paused}) => everyElement(
+        isA<ProviderSubscription<Object?>>().having(
+          (e) => e.isPaused,
+          'isPaused',
+          paused,
+        ),
+      );
+
+      await tester.pumpWidget(build(enabled: true, consumers: 3));
+      final element = tester.container().readProviderElement(provider);
+
+      await tester.pumpWidget(build(enabled: false, consumers: 3));
+
+      expect(element.dependents, hasLength(3));
+      expect(element.dependents, allPaused(paused: true));
+
+      await tester.pumpWidget(build(enabled: false, consumers: 1));
+      await tester.pumpWidget(build(enabled: true, consumers: 1));
+
+      expect(element.dependents, hasLength(1));
+      expect(element.dependents, allPaused(paused: false));
+    });
+
+    testWidgets('stops listening to a TickerMode once its last consumer '
+        'unmounts', (tester) async {
+      late ChangeNotifier notifier;
+
+      Widget build({required bool withConsumers}) {
+        return ProviderScope(
+          child: TickerMode(
+            enabled: true,
+            child: Builder(
+              builder: (context) {
+                notifier = TickerMode.getNotifier(context) as ChangeNotifier;
+                return Column(
+                  children: [
+                    if (withConsumers)
+                      for (var i = 0; i < 3; i++)
+                        Consumer(builder: (_, _, _) => const SizedBox()),
+                  ],
+                );
+              },
+            ),
+          ),
+        );
+      }
+
+      // ignore: invalid_use_of_protected_member
+      bool hasListeners() => notifier.hasListeners;
+
+      await tester.pumpWidget(build(withConsumers: true));
+
+      expect(hasListeners(), isTrue);
+
+      await tester.pumpWidget(build(withConsumers: false));
+
+      expect(hasListeners(), isFalse);
+    });
+
+    testWidgets('a consumer moved under another TickerMode follows it, and '
+        'the TickerMode it left keeps driving its other consumers', (
+      tester,
+    ) async {
+      final stayingProvider = Provider((ref) => 0);
+      final movingProvider = Provider((ref) => 0);
+      final movingKey = GlobalKey();
+
+      final staying = Consumer(
+        builder: (context, ref, _) {
+          ref.watch(stayingProvider);
+          return const SizedBox();
+        },
+      );
+      final moving = Consumer(
+        key: movingKey,
+        builder: (context, ref, _) {
+          ref.watch(movingProvider);
+          return const SizedBox();
+        },
+      );
+
+      Widget build({
+        required bool firstEnabled,
+        required bool secondEnabled,
+        required bool moved,
+      }) {
+        return ProviderScope(
+          child: Column(
+            children: [
+              TickerMode(
+                enabled: firstEnabled,
+                child: Column(children: [staying, if (!moved) moving]),
+              ),
+              TickerMode(
+                enabled: secondEnabled,
+                child: Column(children: [if (moved) moving]),
+              ),
+            ],
+          ),
+        );
+      }
+
+      await tester.pumpWidget(
+        build(firstEnabled: true, secondEnabled: false, moved: false),
+      );
+      final container = tester.container();
+      ProviderSubscription<Object?> subscriptionOf(Provider<int> provider) =>
+          container.readProviderElement(provider).dependents!.single;
+
+      expect(subscriptionOf(movingProvider).isPaused, isFalse);
+
+      await tester.pumpWidget(
+        build(firstEnabled: true, secondEnabled: false, moved: true),
+      );
+
+      expect(subscriptionOf(movingProvider).isPaused, isTrue);
+      expect(subscriptionOf(stayingProvider).isPaused, isFalse);
+
+      await tester.pumpWidget(
+        build(firstEnabled: false, secondEnabled: true, moved: true),
+      );
+
+      expect(subscriptionOf(movingProvider).isPaused, isFalse);
+      expect(subscriptionOf(stayingProvider).isPaused, isTrue);
+    });
+
     testWidgets(
       'mounting a Consumer that watches a paused provider does not throw',
       (tester) async {

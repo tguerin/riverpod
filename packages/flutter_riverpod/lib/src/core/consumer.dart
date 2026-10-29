@@ -439,8 +439,10 @@ base class ConsumerStatefulElement extends StatefulElement
     final newTickerModeNotifier = TickerMode.getNotifier(context);
 
     if (_tickerModeNotifier != newTickerModeNotifier) {
-      _tickerModeNotifier?.removeListener(_updateTickerMode);
-      newTickerModeNotifier.addListener(_updateTickerMode);
+      if (_tickerModeNotifier case final oldNotifier?) {
+        _TickerModeListeners.remove(oldNotifier, this);
+      }
+      _TickerModeListeners.add(newTickerModeNotifier, this);
       _tickerModeNotifier = newTickerModeNotifier;
       _updateTickerMode();
     }
@@ -611,7 +613,9 @@ base class ConsumerStatefulElement extends StatefulElement
 
   @override
   void unmount() {
-    _tickerModeNotifier?.removeListener(_updateTickerMode);
+    if (_tickerModeNotifier case final notifier?) {
+      _TickerModeListeners.remove(notifier, this);
+    }
 
     for (final dependency in _dependencies.values) {
       dependency.close();
@@ -720,5 +724,71 @@ base class ConsumerStatefulElement extends StatefulElement
     listeners.add(sub);
 
     return sub;
+  }
+}
+
+/// The consumers listening to one [TickerMode] notifier, through a single
+/// listener.
+///
+/// [ChangeNotifier.removeListener] finds a listener by a linear scan comparing
+/// closures, so registering one listener per consumer makes unmounting a
+/// subtree quadratic in its consumers.
+final class _TickerModeListeners {
+  _TickerModeListeners(ValueListenable<bool> notifier) {
+    notifier.addListener(_notify);
+  }
+
+  static final _byNotifier =
+      Map<ValueListenable<bool>, _TickerModeListeners>.identity();
+
+  final _elements = <ConsumerStatefulElement>{};
+
+  static void add(
+    ValueListenable<bool> notifier,
+    ConsumerStatefulElement element,
+  ) {
+    final listeners = _byNotifier[notifier] ??= _TickerModeListeners(notifier);
+    listeners._elements.add(element);
+  }
+
+  static void remove(
+    ValueListenable<bool> notifier,
+    ConsumerStatefulElement element,
+  ) {
+    final listeners = _byNotifier[notifier];
+    assert(
+      listeners != null && listeners._elements.contains(element),
+      'A consumer left a TickerMode it was not listening to',
+    );
+    if (listeners == null) return;
+
+    listeners._elements.remove(element);
+
+    if (listeners._elements.isEmpty) {
+      notifier.removeListener(listeners._notify);
+      _byNotifier.remove(notifier);
+    }
+  }
+
+  /// Mirrors [ChangeNotifier.notifyListeners]: a consumer removed during the
+  /// notification is skipped, and an error is reported without stopping the
+  /// others.
+  void _notify() {
+    for (final element in _elements.toList()) {
+      if (!_elements.contains(element)) continue;
+
+      try {
+        element._updateTickerMode();
+      } catch (error, stackTrace) {
+        FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: error,
+            stack: stackTrace,
+            library: 'flutter_riverpod',
+            context: ErrorDescription('while updating a consumer TickerMode'),
+          ),
+        );
+      }
+    }
   }
 }

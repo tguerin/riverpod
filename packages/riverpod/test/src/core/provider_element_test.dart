@@ -10,6 +10,24 @@ import '../utils.dart';
 
 void main() {
   group('ProviderElement', () {
+    test('notifies the remaining listeners in subscription order after one '
+        'of them is closed', () {
+      final container = ProviderContainer.test();
+      final provider = StateProvider((ref) => 0);
+      final calls = <String>[];
+
+      container.listen(provider, (_, _) => calls.add('first'));
+      final second = container.listen(provider, (_, _) => calls.add('second'));
+      container.listen(provider, (_, _) => calls.add('third'));
+      container.listen(provider, (_, _) => calls.add('weak'), weak: true);
+
+      second.close();
+      container.read(provider.notifier).state++;
+
+      expect(calls, ['weak', 'first', 'third']);
+      expect(container.readProviderElement(provider).dependents, hasLength(2));
+    });
+
     group('pausedActiveSubscriptionCount', () {
       test('Handles subscription.pause', () async {
         final container = ProviderContainer.test();

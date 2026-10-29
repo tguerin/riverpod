@@ -423,7 +423,7 @@ abstract class ProviderElement<StateT, ValueT> {
   List<ProviderSubscription>? subscriptions;
 
   @visibleForTesting
-  List<ProviderSubscriptionImpl<Object?>>? dependents;
+  Set<ProviderSubscriptionImpl<Object?>>? dependents;
 
   /// "listen(weak: true)" pointing to this provider.
   ///
@@ -431,7 +431,7 @@ abstract class ProviderElement<StateT, ValueT> {
   /// - They do not count towards [ProviderElement.isActive].
   /// - They may be reused between two instances of a [ProviderElement].
   @visibleForTesting
-  final weakDependents = <ProviderSubscriptionImpl<Object?>>[];
+  final weakDependents = <ProviderSubscriptionImpl<Object?>>{};
 
   var _mustRecomputeState = false;
   var _dependencyMayHaveChanged = false;
@@ -1024,7 +1024,7 @@ The provider ${_debugCurrentlyBuildingElement!.origin} modified $origin while bu
       if (sub.weak) {
         weakDependents.add(sub);
       } else {
-        final dependents = this.dependents ??= [];
+        final dependents = this.dependents ??= {};
         dependents.add(sub);
 
         if (sub.isPaused || !sub.impl.active) pausedActiveSubscriptionCount++;
@@ -1421,7 +1421,7 @@ $this''',
   }
 }
 
-void _closeSubscriptions(List<ProviderSubscription> subscriptions) {
+void _closeSubscriptions(Iterable<ProviderSubscription> subscriptions) {
   final subs = subscriptions.toList();
   for (var i = 0; i < subs.length; i++) {
     subs[i].close();
